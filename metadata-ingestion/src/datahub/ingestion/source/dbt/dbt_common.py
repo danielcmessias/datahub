@@ -112,6 +112,9 @@ from datahub.specific.dataset import DatasetPatchBuilder
 from datahub.utilities.mapping import Constants, OperationProcessor
 from datahub.utilities.time import datetime_to_ts_millis
 
+from datahub.emitter.sql_parsing_builder import SqlParsingBuilder
+from datahub.utilities.sqlglot_lineage import SchemaResolver, sqlglot_lineage
+
 logger = logging.getLogger(__name__)
 DBT_PLATFORM = "dbt"
 
@@ -279,6 +282,11 @@ class DBTCommonConfig(
         "If `target_platform` is Snowflake, the default is True.",
     )
 
+    parse_sql_lineage: bool = Field(
+        default=False,
+        description="When enabled, parse the compiled SQL to extract lineage information."
+    )
+
     @validator("target_platform")
     def validate_target_platform_value(cls, target_platform: str) -> str:
         if target_platform.lower() == DBT_PLATFORM:
@@ -383,6 +391,8 @@ class DBTNode:
 
     tags: List[str] = field(default_factory=list)
     compiled_code: Optional[str] = None
+
+    created_at: Optional[datetime] = None
 
     test_info: Optional["DBTTest"] = None  # only populated if node_type == 'test'
     test_result: Optional["DBTTestResult"] = None
@@ -691,6 +701,14 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self, self.config, ctx
         )
 
+        if self.config.parse_sql_lineage:
+            self.schema_resolver, _ = self.ctx.graph.initialize_schema_resolver_from_datahub(
+                platform=self.platform,
+                platform_instance=self.config.platform_instance,
+                env=self.config.env,
+            )
+
+
     def create_test_entity_mcps(
         self,
         test_nodes: List[DBTNode],
@@ -918,11 +936,15 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.target_platform_instance,
         )
 
-        yield from self.create_test_entity_mcps(
-            test_nodes,
-            additional_custom_props_filtered,
-            all_nodes_map,
-        )
+        # yield from self.create_test_entity_mcps(
+        #     test_nodes,
+        #     additional_custom_props_filtered,
+        #     all_nodes_map,
+        # )
+
+        # test: emit column lineage
+        if self.config.parse_sql_lineage:
+            yield from self.create_lineage_mces(non_test_nodes)
 
     def filter_nodes(self, all_nodes: List[DBTNode]) -> List[DBTNode]:
         nodes = []
@@ -1053,6 +1075,64 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             yield MetadataWorkUnit(
                 id=dataset_snapshot.urn, mce=mce, is_primary_source=is_primary_source
             )
+
+    def create_lineage_mces(self, nodes) -> Iterable[MetadataWorkUnit]:
+        builder = SqlParsingBuilder(
+        #    generate_lineage=True,
+        #    generate_usage_statistics=False,
+        #    generate_operations=False, 
+        )
+        for node in nodes:
+            # if "application_flow" not in node.name:
+            #     continue
+
+            if not node.compiled_code:
+                # raise Exception(f"No compiled code for {node.name}")
+                continue
+
+            # Enclose the query in a CTAS. The real CTAS-query depends on the adapter (and isn't
+            # included in the manifest), but we don't need it. All we really need to do is let
+            # sqlglot know that this query has a downstream. Better ideas welcome here :)
+            query = f"CREATE TABLE {node.database}.{node.schema}.{node.name} AS {node.compiled_code}"
+            result = sqlglot_lineage(
+                sql=query,
+                schema_resolver=self.schema_resolver,
+            )
+
+            # logger.info(query)
+            # logger.info("*************")
+            # logger.info(result)
+            # raise Exception("See above")
+
+            if result.debug_info.table_error:
+                logger.info(f"Error parsing table lineage, {result.debug_info.table_error}")
+            elif result.debug_info.column_error:
+                logger.info(
+                    f"Error parsing column lineage, {result.debug_info.column_error}"
+                )
+
+            for cl in result.column_lineage or []:
+                logger.info(f"\n{cl.downstream}\n{cl.upstreams}\n{cl.logic}")
+
+            # This works, so long as manually prefix the CTAS statement.  
+            # NOTE: Since this returns an iterator we need to convert to force evaluation or yield
+            list(builder.process_sql_parsing_result(result, query=query))
+            # yield from list(builder.process_sql_parsing_result(
+            #     result,
+            #     query=query,
+            #     query_timestamp=datetime.now(),
+            #     user="urn:li:corpuser:datahub",
+            #     # custom_operation_type=entry.operation_type,
+            #     # include_urns=self.urns,
+            # ))
+        
+        # res = list(builder.gen_workunits())
+        # if len(res) == 0:
+        #     raise Exception("GOT NOTHING :(")
+        # for r in res:
+        #     logging.info(f"Generated workunit: {r}")
+
+        yield from builder.gen_workunits()
 
     def extract_query_tag_aspects(
         self,

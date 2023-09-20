@@ -658,6 +658,8 @@ def _get_dialect(platform: str) -> str:
     # TODO: convert datahub platform names to sqlglot dialect
     if platform == "presto-on-hive":
         return "hive"
+    elif platform == "athena":
+        return "presto"
     else:
         return platform
 
@@ -668,7 +670,9 @@ def _sqlglot_lineage_inner(
     default_db: Optional[str] = None,
     default_schema: Optional[str] = None,
 ) -> SqlParsingResult:
-    dialect = _get_dialect(schema_resolver.platform)
+    # TODO: don't hardcode xD
+    dialect = "presto"
+    # dialect = _get_dialect(schema_resolver.platform)
     if dialect == "snowflake":
         # in snowflake, table identifiers must be uppercased to match sqlglot's behavior.
         if default_db:
@@ -846,22 +850,22 @@ def sqlglot_lineage(
         table_error or column_error are set, then the parsing failed and the
         other fields may be incomplete.
     """
-    try:
-        return _sqlglot_lineage_inner(
-            sql=sql,
-            schema_resolver=schema_resolver,
-            default_db=default_db,
-            default_schema=default_schema,
-        )
-    except Exception as e:
-        return SqlParsingResult(
-            in_tables=[],
-            out_tables=[],
-            column_lineage=None,
-            debug_info=SqlParsingDebugInfo(
-                table_error=e,
-            ),
-        )
+    # try:
+    return _sqlglot_lineage_inner(
+        sql=sql,
+        schema_resolver=schema_resolver,
+        default_db=default_db,
+        default_schema=default_schema,
+    )
+    # except Exception as e:
+    #     return SqlParsingResult(
+    #         in_tables=[],
+    #         out_tables=[],
+    #         column_lineage=None,
+    #         debug_info=SqlParsingDebugInfo(
+    #             table_error=e,
+    #         ),
+    #     )
 
 
 def create_lineage_sql_parsed_result(

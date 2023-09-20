@@ -247,6 +247,7 @@ def extract_dbt_entities(
             compiled_code=manifest_node.get(
                 "compiled_code", manifest_node.get("compiled_sql")
             ),  # Backward compatibility dbt <=v1.2
+            created_at=manifest_node.get("created_at"),
             test_info=test_info,
         )
 
