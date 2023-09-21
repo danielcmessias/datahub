@@ -527,6 +527,7 @@ def _column_level_lineage(  # noqa: C901
                 # if they appear in the output.
                 continue
 
+            # This is the bit that fails :(
             lineage_node = sqlglot.lineage.lineage(
                 output_col,
                 statement,

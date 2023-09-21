@@ -96,6 +96,9 @@ from datahub.metadata.schema_classes import (
     DatasetAssertionInfoClass,
     DatasetAssertionScopeClass,
     DatasetPropertiesClass,
+    FineGrainedLineageClass,
+    FineGrainedLineageDownstreamTypeClass,
+    FineGrainedLineageUpstreamTypeClass,
     GlobalTagsClass,
     GlossaryTermsClass,
     OwnerClass,
@@ -113,7 +116,13 @@ from datahub.utilities.mapping import Constants, OperationProcessor
 from datahub.utilities.time import datetime_to_ts_millis
 
 from datahub.emitter.sql_parsing_builder import SqlParsingBuilder
-from datahub.utilities.sqlglot_lineage import SchemaResolver, sqlglot_lineage
+from datahub.utilities.sqlglot_lineage import SchemaResolver, sqlglot_lineage, _column_level_lineage, _TableName, SqlUnderstandingError, SchemaInfo
+import sqlglot
+import sqlglot.errors
+import sqlglot.lineage
+import sqlglot.optimizer.qualify
+import sqlglot.optimizer.qualify_columns
+
 
 logger = logging.getLogger(__name__)
 DBT_PLATFORM = "dbt"
@@ -282,9 +291,13 @@ class DBTCommonConfig(
         "If `target_platform` is Snowflake, the default is True.",
     )
 
-    parse_sql_lineage: bool = Field(
+    enable_sql_parsing: bool = Field(
         default=False,
-        description="When enabled, parse the compiled SQL to extract lineage information."
+        description="When true, parse the compiled SQL to extract column information."
+    )
+    sql_parsing_dialect: Optional[str] = Field(
+        default=None,
+        description="Sets the dialect used by SQLGlot to parse the SQL. If not set, will use the target platform."
     )
 
     @validator("target_platform")
@@ -485,7 +498,10 @@ def get_upstreams(
     return upstream_urns
 
 
-def get_upstream_lineage(upstream_urns: List[str]) -> UpstreamLineage:
+def get_upstream_lineage(
+        upstream_urns: List[str],
+        fine_grained_lineages: Optional[List[FineGrainedLineageClass]] = None,
+    ) -> UpstreamLineage:
     ucl: List[UpstreamClass] = []
 
     for dep in upstream_urns:
@@ -496,7 +512,7 @@ def get_upstream_lineage(upstream_urns: List[str]) -> UpstreamLineage:
         uc.auditStamp.time = int(datetime.utcnow().timestamp() * 1000)
         ucl.append(uc)
 
-    return UpstreamLineage(upstreams=ucl)
+    return UpstreamLineage(upstreams=ucl, fineGrainedLineages=fine_grained_lineages)
 
 
 # See https://github.com/fishtown-analytics/dbt/blob/master/core/dbt/adapters/sql/impl.py
@@ -701,7 +717,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self, self.config, ctx
         )
 
-        if self.config.parse_sql_lineage:
+        if self.config.enable_sql_parsing:
             self.schema_resolver, _ = self.ctx.graph.initialize_schema_resolver_from_datahub(
                 platform=self.platform,
                 platform_instance=self.config.platform_instance,
@@ -928,13 +944,13 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.platform_instance,
         )
 
-        yield from self.create_platform_mces(
-            non_test_nodes,
-            additional_custom_props_filtered,
-            all_nodes_map,
-            self.config.target_platform,
-            self.config.target_platform_instance,
-        )
+        # yield from self.create_platform_mces(
+        #     non_test_nodes,
+        #     additional_custom_props_filtered,
+        #     all_nodes_map,
+        #     self.config.target_platform,
+        #     self.config.target_platform_instance,
+        # )
 
         # yield from self.create_test_entity_mcps(
         #     test_nodes,
@@ -943,8 +959,8 @@ class DBTSourceBase(StatefulIngestionSourceBase):
         # )
 
         # test: emit column lineage
-        if self.config.parse_sql_lineage:
-            yield from self.create_lineage_mces(non_test_nodes)
+        # if self.config.parse_sql_lineage:
+        #     yield from self.create_lineage_mces(non_test_nodes)
 
     def filter_nodes(self, all_nodes: List[DBTNode]) -> List[DBTNode]:
         nodes = []
@@ -1050,6 +1066,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                         self.config.platform_instance,
                     )
                     upstreams_lineage_class = get_upstream_lineage([upstream_dbt_urn])
+
                     if self.config.incremental_lineage:
                         patch_builder: DatasetPatchBuilder = DatasetPatchBuilder(
                             urn=node_datahub_urn
@@ -1435,6 +1452,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
     ) -> Optional[UpstreamLineageClass]:
         """
         This method creates lineage amongst dbt nodes. A dbt node can be linked to other dbt nodes or a platform node.
+        If SQL Parsing is enabled, we will also generate column lineage.
         """
         upstream_urns = get_upstreams(
             node.upstream_nodes,
@@ -1455,10 +1473,109 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                     self.config.target_platform_instance,
                 )
             )
+
         if upstream_urns:
-            upstreams_lineage_class = get_upstream_lineage(upstream_urns)
-            return upstreams_lineage_class
+            fine_grained_lineages = [] 
+            if self.config.enable_sql_parsing:
+                fine_grained_lineages = self._create_fine_grained_lineage(node, all_nodes_map)
+
+                if node.name == "daniel_messias__gpo_offer_flow__cases_latest":
+                    from pprint import pformat
+                    raise Exception(pformat(fine_grained_lineages))
+
+            return get_upstream_lineage(upstream_urns, fine_grained_lineages)
         return None
+
+    def _create_fine_grained_lineage(
+            self, node: DBTNode,
+            all_nodes_map: Dict[str, DBTNode],
+    ):
+        """
+        This method creates the fine grained lineage for a dbt node by parsing the compiled SQL
+        using SQLGlot. Since we already know table lineage from the manifest, we only need to
+        look for the column lineage.
+        """
+        if not node.compiled_code:
+            return []
+
+        dialect = self.config.sql_parsing_dialect or self.config.target_platform
+
+        downstream_table = _TableName(database=node.database, db_schema=node.schema, table=node.name)
+        upstream_table_schemas: Dict[_TableName, SchemaInfo] = {}
+        upstream_table_urns: Dict[_TableName, str] = {}
+        for upstream_node_name in node.upstream_nodes:
+            upstream_node = all_nodes_map[upstream_node_name]
+            upstream_table = _TableName(
+                database=upstream_node.database,
+                db_schema=upstream_node.schema,
+                table=upstream_node.name,
+            )
+
+            urn, schema_info = self.schema_resolver.resolve_table(upstream_table)
+            if schema_info:
+                upstream_table_urns[upstream_table] = urn
+                upstream_table_schemas[upstream_table] = schema_info 
+
+        # parse the compiled model SQL 
+        statement = sqlglot.parse_one(
+            node.compiled_code,
+            dialect=dialect,
+            error_level=sqlglot.ErrorLevel.WARN,
+        )
+
+        column_lineage_info = []
+        try:
+            column_lineage_info = _column_level_lineage(
+                statement,
+                dialect=dialect,
+                input_tables=upstream_table_schemas,
+                output_table=downstream_table,
+                default_db="awscatalog",
+                default_schema="default",
+            )
+        except SqlUnderstandingError as e:
+            # TODO: Needs better error handling
+            logger.error(f"Error parsing column lineage for node: {node.name}")
+
+
+        fine_grained_lineages = []
+        for cl in column_lineage_info:
+            if not cl.upstreams:
+                continue
+
+            downstream_table_urn = node.get_urn(
+                DBT_PLATFORM,  # TODO: I had this set before as target_platform? Was that right?
+                # self.config.target_platform, 
+                self.config.env,
+                # self.config.target_platform_instance,
+                self.config.platform_instance,
+            )
+
+            try:
+                upstreams = sorted([
+                    mce_builder.make_schema_field_urn(
+                        upstream_table_urns[upstream_col_ref.table],
+                        upstream_col_ref.column,
+                    )
+                    for upstream_col_ref in cl.upstreams
+                ])
+            except KeyError as e:
+                raise Exception(upstream_table_urns.keys(), e)
+
+            fine_grained_lineages.append(FineGrainedLineageClass(
+                upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                upstreams=upstreams,
+                downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+                downstreams=[
+                    mce_builder.make_schema_field_urn(
+                        downstream_table_urn,
+                        cl.downstream.column,
+                    )
+                ],
+            ))
+
+        return fine_grained_lineages
+
 
     # This method attempts to read-modify and return the owners of a dataset.
     # From the existing owners it will remove the owners that are of the source_type_filter and
