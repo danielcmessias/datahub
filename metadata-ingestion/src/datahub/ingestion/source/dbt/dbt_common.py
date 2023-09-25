@@ -512,7 +512,8 @@ def get_upstream_lineage(
         uc.auditStamp.time = int(datetime.utcnow().timestamp() * 1000)
         ucl.append(uc)
 
-    return UpstreamLineage(upstreams=ucl, fineGrainedLineages=fine_grained_lineages)
+    return UpstreamLineage(upstreams=ucl)
+    # return UpstreamLineage(upstreams=ucl, fineGrainedLineages=fine_grained_lineages)
 
 
 # See https://github.com/fishtown-analytics/dbt/blob/master/core/dbt/adapters/sql/impl.py
@@ -1430,7 +1431,9 @@ class DBTSourceBase(StatefulIngestionSourceBase):
         using SQLGlot. Since we already know table lineage from the manifest, we only need to
         look for the column lineage.
         """
+
         if not node.compiled_code:
+            logger.info(f"No compiled code for node: {node.name}")
             return []
 
         dialect = self.config.sql_parsing_dialect or self.config.target_platform
@@ -1472,6 +1475,10 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             # TODO: Needs better error handling
             logger.error(f"Error parsing column lineage for node: {node.name}")
 
+
+        if "cases_latest" in node.name:
+            from pprint import pformat
+            logger.info(pformat(column_lineage_info))
 
         fine_grained_lineages = []
         for cl in column_lineage_info:

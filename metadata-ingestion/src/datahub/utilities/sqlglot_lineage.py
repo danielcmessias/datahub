@@ -497,6 +497,8 @@ def _column_level_lineage(  # noqa: C901
         raise SqlUnderstandingError(
             f"sqlglot failed to map columns to their source tables; likely missing/outdated table schema info: {e}"
         ) from e
+    except Exception as e:
+        raise Exception(statement.sql(pretty=True, dialect=dialect), e)
     logger.debug("Qualified sql %s", statement.sql(pretty=True, dialect=dialect))
 
     column_lineage = []
