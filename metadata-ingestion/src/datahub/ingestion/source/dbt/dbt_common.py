@@ -1468,7 +1468,8 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 dialect=dialect,
                 input_tables=upstream_table_schemas,
                 output_table=downstream_table,
-                default_db="awscatalog",
+                # default_db="awscatalog",  # ?
+                default_db=None,
                 default_schema="default",
             )
         except SqlUnderstandingError as e:
