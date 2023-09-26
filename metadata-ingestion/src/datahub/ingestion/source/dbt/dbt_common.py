@@ -423,7 +423,13 @@ class DBTNode:
         env: str,
         data_platform_instance: Optional[str],
     ) -> str:
+        # # HACK:
+        # if target_platform == "athena":
+        #     db_fqn = f"{self.schema}.{self.name}"
+        # else:
+            # db_fqn = self.get_db_fqn()
         db_fqn = self.get_db_fqn()
+
         if target_platform != DBT_PLATFORM:
             db_fqn = db_fqn.lower()
         return mce_builder.make_dataset_urn_with_platform_instance(
@@ -512,8 +518,7 @@ def get_upstream_lineage(
         uc.auditStamp.time = int(datetime.utcnow().timestamp() * 1000)
         ucl.append(uc)
 
-    return UpstreamLineage(upstreams=ucl)
-    # return UpstreamLineage(upstreams=ucl, fineGrainedLineages=fine_grained_lineages)
+    return UpstreamLineage(upstreams=ucl, fineGrainedLineages=fine_grained_lineages)
 
 
 # See https://github.com/fishtown-analytics/dbt/blob/master/core/dbt/adapters/sql/impl.py
@@ -724,7 +729,6 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 platform_instance=self.config.platform_instance,
                 env=self.config.env,
             )
-
 
     def create_test_entity_mcps(
         self,
@@ -1034,6 +1038,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 upstream_lineage_class = self._create_lineage_aspect_for_dbt_node(
                     node, all_nodes_map
                 )
+
                 if upstream_lineage_class:
                     aspects.append(upstream_lineage_class)
 
@@ -1402,6 +1407,12 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.platform_instance,
         )
 
+        if node.name == "uat__gpo_offer_flow__cases_latest":
+            raise Exception(upstream_urns)
+
+        # if "cases_latest" in  node.name:
+        #     raise Exception(upstream_urns)
+
         # if a node is of type source in dbt, its upstream lineage should have the corresponding table/view
         # from the platform. This code block is executed when we are generating entities of type "dbt".
         if node.node_type == "source":
@@ -1415,8 +1426,8 @@ class DBTSourceBase(StatefulIngestionSourceBase):
 
         if upstream_urns:
             fine_grained_lineages = [] 
-            if self.config.enable_sql_parsing:
-                fine_grained_lineages = self._create_fine_grained_lineage(node, all_nodes_map)
+            # if self.config.enable_sql_parsing:
+            #     fine_grained_lineages = self._create_fine_grained_lineage(node, all_nodes_map)
 
             return get_upstream_lineage(upstream_urns, fine_grained_lineages)
 
@@ -1444,12 +1455,14 @@ class DBTSourceBase(StatefulIngestionSourceBase):
         for upstream_node_name in node.upstream_nodes:
             upstream_node = all_nodes_map[upstream_node_name]
             upstream_table = _TableName(
+                # database=upstream_node.database or "awsdatacatalog",  # HACK
                 database=upstream_node.database,
                 db_schema=upstream_node.schema,
                 table=upstream_node.name,
             )
 
             urn, schema_info = self.schema_resolver.resolve_table(upstream_table)
+
             if schema_info:
                 upstream_table_urns[upstream_table] = urn
                 upstream_table_schemas[upstream_table] = schema_info 
@@ -1468,18 +1481,13 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 dialect=dialect,
                 input_tables=upstream_table_schemas,
                 output_table=downstream_table,
-                # default_db="awscatalog",  # ?
-                default_db=None,
+                default_db="awscatalog",
                 default_schema="default",
             )
         except SqlUnderstandingError as e:
             # TODO: Needs better error handling
             logger.error(f"Error parsing column lineage for node: {node.name}")
 
-
-        if "cases_latest" in node.name:
-            from pprint import pformat
-            logger.info(pformat(column_lineage_info))
 
         fine_grained_lineages = []
         for cl in column_lineage_info:
@@ -1493,6 +1501,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 # self.config.target_platform_instance,
                 self.config.platform_instance,
             )
+
 
             try:
                 upstreams = sorted([

@@ -529,7 +529,6 @@ def _column_level_lineage(  # noqa: C901
                 # if they appear in the output.
                 continue
 
-            # This is the bit that fails :(
             lineage_node = sqlglot.lineage.lineage(
                 output_col,
                 statement,
@@ -673,9 +672,7 @@ def _sqlglot_lineage_inner(
     default_db: Optional[str] = None,
     default_schema: Optional[str] = None,
 ) -> SqlParsingResult:
-    # TODO: don't hardcode xD
-    dialect = "presto"
-    # dialect = _get_dialect(schema_resolver.platform)
+    dialect = _get_dialect(schema_resolver.platform)
     if dialect == "snowflake":
         # in snowflake, table identifiers must be uppercased to match sqlglot's behavior.
         if default_db:
