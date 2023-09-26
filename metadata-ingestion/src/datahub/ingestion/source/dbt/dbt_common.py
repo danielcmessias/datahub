@@ -1407,8 +1407,8 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.platform_instance,
         )
 
-        if node.name == "uat__gpo_offer_flow__cases_latest":
-            raise Exception(upstream_urns)
+        # if node.name == "uat__gpo_offer_flow__cases_latest":
+        #     raise Exception(upstream_urns)
 
         # if "cases_latest" in  node.name:
         #     raise Exception(upstream_urns)
