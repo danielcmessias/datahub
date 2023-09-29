@@ -120,7 +120,6 @@ class SqlParsingBuilder:
         """
         downstreams_to_ingest = result.out_tables
         upstreams_to_ingest = result.in_tables
-
         if include_urns:
             logger.debug(f"Skipping urns {set(downstreams_to_ingest) - include_urns}")
             downstreams_to_ingest = list(set(downstreams_to_ingest) & include_urns)
@@ -200,12 +199,9 @@ class SqlParsingBuilder:
                 )
                 or None,
             )
-            wu =MetadataChangeProposalWrapper(
+            yield MetadataChangeProposalWrapper(
                 entityUrn=downstream_urn, aspect=upstream_lineage
             ).as_workunit()
-            logger.info("WU:")
-            logger.info(wu)
-            yield wu
 
     def _gen_usage_statistics_workunits(self) -> Iterable[MetadataWorkUnit]:
         yield from self._usage_aggregator.generate_workunits(

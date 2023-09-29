@@ -937,8 +937,6 @@ class GlueSource(StatefulIngestionSourceBase):
         databases, tables = self.get_all_databases_and_tables()
 
         for table in tables:
-            from pprint import pformat
-            raise Exception(pformat(table))
             database_name = table["DatabaseName"]
             table_name = table["Name"]
             full_table_name = f"{database_name}.{table_name}"
@@ -958,7 +956,6 @@ class GlueSource(StatefulIngestionSourceBase):
                 env=self.env,
                 platform_instance=self.source_config.platform_instance,
             )
-
 
             mce = self._extract_record(dataset_urn, table, full_table_name)
             yield MetadataWorkUnit(full_table_name, mce=mce)

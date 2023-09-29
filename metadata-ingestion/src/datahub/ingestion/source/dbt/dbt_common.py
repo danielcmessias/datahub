@@ -957,6 +957,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.target_platform_instance,
         )
 
+        # TODO: Renable. Disabled because I don't care about test nodes right now
         # yield from self.create_test_entity_mcps(
         #     test_nodes,
         #     additional_custom_props_filtered,
@@ -1003,6 +1004,10 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.strip_user_ids_from_email,
         )
         for node in sorted(dbt_nodes, key=lambda n: n.dbt_name):
+
+            # if node.name != "application_event":
+            #     continue
+
             is_primary_source = mce_platform == DBT_PLATFORM
             node_datahub_urn = node.get_urn(
                 mce_platform,
@@ -1038,6 +1043,9 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 upstream_lineage_class = self._create_lineage_aspect_for_dbt_node(
                     node, all_nodes_map
                 )
+
+                # if node.name == "application_event":
+                #     raise Exception(upstream_lineage_class, node.name)
 
                 if upstream_lineage_class:
                     aspects.append(upstream_lineage_class)
@@ -1407,12 +1415,6 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.platform_instance,
         )
 
-        # if node.name == "uat__gpo_offer_flow__cases_latest":
-        #     raise Exception(upstream_urns)
-
-        # if "cases_latest" in  node.name:
-        #     raise Exception(upstream_urns)
-
         # if a node is of type source in dbt, its upstream lineage should have the corresponding table/view
         # from the platform. This code block is executed when we are generating entities of type "dbt".
         if node.node_type == "source":
@@ -1426,9 +1428,14 @@ class DBTSourceBase(StatefulIngestionSourceBase):
 
         if upstream_urns:
             fine_grained_lineages = [] 
-            # if self.config.enable_sql_parsing:
-            #     fine_grained_lineages = self._create_fine_grained_lineage(node, all_nodes_map)
+            if self.config.enable_sql_parsing:
+                fine_grained_lineages = self._create_fine_grained_lineage(node, all_nodes_map)
 
+            # TODO: I _think_ in some cases you can generate syntactically correct fine_grained_lineages
+            # but the GMS will still not accept them. Then you get no lineage. Maybe a red herring?
+            # I was seeing problems when parsing/ingesting the model application_event. Double check
+            # if this really is an issue, and if so figure out wtf is happening. Maybe something in the
+            # sibling hook?            
             return get_upstream_lineage(upstream_urns, fine_grained_lineages)
 
         return None
@@ -1442,8 +1449,8 @@ class DBTSourceBase(StatefulIngestionSourceBase):
         using SQLGlot. Since we already know table lineage from the manifest, we only need to
         look for the column lineage.
         """
-
         if not node.compiled_code:
+            # TODO: Needs better error handling?
             logger.info(f"No compiled code for node: {node.name}")
             return []
 
@@ -1455,7 +1462,6 @@ class DBTSourceBase(StatefulIngestionSourceBase):
         for upstream_node_name in node.upstream_nodes:
             upstream_node = all_nodes_map[upstream_node_name]
             upstream_table = _TableName(
-                # database=upstream_node.database or "awsdatacatalog",  # HACK
                 database=upstream_node.database,
                 db_schema=upstream_node.schema,
                 table=upstream_node.name,
@@ -1484,6 +1490,10 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 default_db="awscatalog",
                 default_schema="default",
             )
+            if node.name == "temp_9_application_event":
+                from pprint import pformat
+                logger.info(pformat(column_lineage_info))
+                raise Exception()
         except SqlUnderstandingError as e:
             # TODO: Needs better error handling
             logger.error(f"Error parsing column lineage for node: {node.name}")
@@ -1495,28 +1505,28 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 continue
 
             downstream_table_urn = node.get_urn(
-                DBT_PLATFORM,  # TODO: I had this set before as target_platform? Was that right?
-                # self.config.target_platform, 
+                DBT_PLATFORM,  
                 self.config.env,
-                # self.config.target_platform_instance,
                 self.config.platform_instance,
             )
 
-
-            try:
-                upstreams = sorted([
-                    mce_builder.make_schema_field_urn(
-                        upstream_table_urns[upstream_col_ref.table],
-                        upstream_col_ref.column,
+            upstreams = []
+            for upstream_col_ref in cl.upstreams:
+                logger.info(f"Upstream: {upstream_col_ref}")
+                try:
+                    upstreams.append(
+                        mce_builder.make_schema_field_urn(
+                            upstream_table_urns[upstream_col_ref.table],
+                            upstream_col_ref.column,
+                        )
                     )
-                    for upstream_col_ref in cl.upstreams
-                ])
-            except KeyError as e:
-                raise Exception(upstream_table_urns.keys(), e)
+                except KeyError:
+                    # TODO: Better error handling
+                    logger.error(f"Could not find table {upstream_col_ref.table} in {upstream_table_urns.keys()}")
 
             fine_grained_lineages.append(FineGrainedLineageClass(
                 upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
-                upstreams=upstreams,
+                upstreams=sorted(upstreams),
                 downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
                 downstreams=[
                     mce_builder.make_schema_field_urn(

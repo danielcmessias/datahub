@@ -172,6 +172,16 @@ class SqlQueriesSource(Source):
             )
             self.report.num_column_parse_failures += 1
 
+        yield from self.builder.process_sql_parsing_result(
+            result,
+            query=entry.query,
+            query_timestamp=entry.timestamp,
+            user=entry.user,
+            custom_operation_type=entry.operation_type,
+            include_urns=self.urns,
+        )
+
+
 @dataclass
 class QueryEntry:
     query: str
