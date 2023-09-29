@@ -247,6 +247,9 @@ def extract_dbt_entities(
             compiled_code=manifest_node.get(
                 "compiled_code", manifest_node.get("compiled_sql")
             ),  # Backward compatibility dbt <=v1.2
+            # This was added for a much earlier implementation in the spike. I'm pretty sure this
+            # created_at stuff can be removed now
+            created_at=manifest_node.get("created_at"), 
             test_info=test_info,
         )
 

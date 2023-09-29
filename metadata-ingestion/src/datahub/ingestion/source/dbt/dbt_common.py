@@ -96,6 +96,9 @@ from datahub.metadata.schema_classes import (
     DatasetAssertionInfoClass,
     DatasetAssertionScopeClass,
     DatasetPropertiesClass,
+    FineGrainedLineageClass,
+    FineGrainedLineageDownstreamTypeClass,
+    FineGrainedLineageUpstreamTypeClass,
     GlobalTagsClass,
     GlossaryTermsClass,
     OwnerClass,
@@ -111,6 +114,15 @@ from datahub.metadata.schema_classes import (
 from datahub.specific.dataset import DatasetPatchBuilder
 from datahub.utilities.mapping import Constants, OperationProcessor
 from datahub.utilities.time import datetime_to_ts_millis
+
+from datahub.emitter.sql_parsing_builder import SqlParsingBuilder
+from datahub.utilities.sqlglot_lineage import SchemaResolver, sqlglot_lineage, _column_level_lineage, _TableName, SqlUnderstandingError, SchemaInfo
+import sqlglot
+import sqlglot.errors
+import sqlglot.lineage
+import sqlglot.optimizer.qualify
+import sqlglot.optimizer.qualify_columns
+
 
 logger = logging.getLogger(__name__)
 DBT_PLATFORM = "dbt"
@@ -279,6 +291,15 @@ class DBTCommonConfig(
         "If `target_platform` is Snowflake, the default is True.",
     )
 
+    enable_sql_parsing: bool = Field(
+        default=False,
+        description="When true, parse the compiled SQL to extract column information."
+    )
+    sql_parsing_dialect: Optional[str] = Field(
+        default=None,
+        description="Sets the dialect used by SQLGlot to parse the SQL. If not set, will use the target platform."
+    )
+
     @validator("target_platform")
     def validate_target_platform_value(cls, target_platform: str) -> str:
         if target_platform.lower() == DBT_PLATFORM:
@@ -384,6 +405,8 @@ class DBTNode:
     tags: List[str] = field(default_factory=list)
     compiled_code: Optional[str] = None
 
+    created_at: Optional[datetime] = None
+
     test_info: Optional["DBTTest"] = None  # only populated if node_type == 'test'
     test_result: Optional["DBTTestResult"] = None
 
@@ -401,6 +424,7 @@ class DBTNode:
         data_platform_instance: Optional[str],
     ) -> str:
         db_fqn = self.get_db_fqn()
+
         if target_platform != DBT_PLATFORM:
             db_fqn = db_fqn.lower()
         return mce_builder.make_dataset_urn_with_platform_instance(
@@ -475,7 +499,10 @@ def get_upstreams(
     return upstream_urns
 
 
-def get_upstream_lineage(upstream_urns: List[str]) -> UpstreamLineage:
+def get_upstream_lineage(
+        upstream_urns: List[str],
+        fine_grained_lineages: Optional[List[FineGrainedLineageClass]] = None,
+    ) -> UpstreamLineage:
     ucl: List[UpstreamClass] = []
 
     for dep in upstream_urns:
@@ -486,7 +513,7 @@ def get_upstream_lineage(upstream_urns: List[str]) -> UpstreamLineage:
         uc.auditStamp.time = int(datetime.utcnow().timestamp() * 1000)
         ucl.append(uc)
 
-    return UpstreamLineage(upstreams=ucl)
+    return UpstreamLineage(upstreams=ucl, fineGrainedLineages=fine_grained_lineages)
 
 
 # See https://github.com/fishtown-analytics/dbt/blob/master/core/dbt/adapters/sql/impl.py
@@ -690,6 +717,13 @@ class DBTSourceBase(StatefulIngestionSourceBase):
         self.stale_entity_removal_handler = StaleEntityRemovalHandler.create(
             self, self.config, ctx
         )
+
+        if self.config.enable_sql_parsing:
+            self.schema_resolver, _ = self.ctx.graph.initialize_schema_resolver_from_datahub(
+                platform=self.platform,
+                platform_instance=self.config.platform_instance,
+                env=self.config.env,
+            )
 
     def create_test_entity_mcps(
         self,
@@ -918,11 +952,12 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.target_platform_instance,
         )
 
-        yield from self.create_test_entity_mcps(
-            test_nodes,
-            additional_custom_props_filtered,
-            all_nodes_map,
-        )
+        # TODO: Renable. Disabled because I don't care about test nodes right now
+        # yield from self.create_test_entity_mcps(
+        #     test_nodes,
+        #     additional_custom_props_filtered,
+        #     all_nodes_map,
+        # )
 
     def filter_nodes(self, all_nodes: List[DBTNode]) -> List[DBTNode]:
         nodes = []
@@ -999,6 +1034,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 upstream_lineage_class = self._create_lineage_aspect_for_dbt_node(
                     node, all_nodes_map
                 )
+
                 if upstream_lineage_class:
                     aspects.append(upstream_lineage_class)
 
@@ -1028,6 +1064,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                         self.config.platform_instance,
                     )
                     upstreams_lineage_class = get_upstream_lineage([upstream_dbt_urn])
+
                     if self.config.incremental_lineage:
                         patch_builder: DatasetPatchBuilder = DatasetPatchBuilder(
                             urn=node_datahub_urn
@@ -1355,6 +1392,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
     ) -> Optional[UpstreamLineageClass]:
         """
         This method creates lineage amongst dbt nodes. A dbt node can be linked to other dbt nodes or a platform node.
+        If SQL Parsing is enabled, we will also generate column lineage.
         """
         upstream_urns = get_upstreams(
             node.upstream_nodes,
@@ -1375,10 +1413,119 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                     self.config.target_platform_instance,
                 )
             )
+
         if upstream_urns:
-            upstreams_lineage_class = get_upstream_lineage(upstream_urns)
-            return upstreams_lineage_class
+            fine_grained_lineages = [] 
+            if self.config.enable_sql_parsing:
+                fine_grained_lineages = self._create_fine_grained_lineage(node, all_nodes_map)
+
+            # TODO: I _think_ in some cases you can generate syntactically correct fine_grained_lineages
+            # but the GMS will still not accept them. Then you get no lineage. Maybe a red herring?
+            # I was seeing problems when parsing/ingesting the model application_event. Double check
+            # if this really is an issue, and if so figure out wtf is happening. Maybe something in the
+            # sibling hook?            
+            return get_upstream_lineage(upstream_urns, fine_grained_lineages)
+
         return None
+
+    def _create_fine_grained_lineage(
+            self, node: DBTNode,
+            all_nodes_map: Dict[str, DBTNode],
+    ):
+        """
+        This method creates the fine grained lineage for a dbt node by parsing the compiled SQL
+        using SQLGlot. Since we already know table lineage from the manifest, we only need to
+        look for the column lineage.
+        """
+        if not node.compiled_code:
+            # TODO: Needs better error handling?
+            logger.info(f"No compiled code for node: {node.name}")
+            return []
+
+        dialect = self.config.sql_parsing_dialect or self.config.target_platform
+
+        downstream_table = _TableName(database=node.database, db_schema=node.schema, table=node.name)
+        upstream_table_schemas: Dict[_TableName, SchemaInfo] = {}
+        upstream_table_urns: Dict[_TableName, str] = {}
+        for upstream_node_name in node.upstream_nodes:
+            upstream_node = all_nodes_map[upstream_node_name]
+            upstream_table = _TableName(
+                database=upstream_node.database,
+                db_schema=upstream_node.schema,
+                table=upstream_node.name,
+            )
+
+            urn, schema_info = self.schema_resolver.resolve_table(upstream_table)
+
+            if schema_info:
+                upstream_table_urns[upstream_table] = urn
+                upstream_table_schemas[upstream_table] = schema_info 
+
+        # parse the compiled model SQL 
+        statement = sqlglot.parse_one(
+            node.compiled_code,
+            dialect=dialect,
+            # TODO: Should this be a WARN?
+            error_level=sqlglot.ErrorLevel.WARN,
+        )
+
+        column_lineage_info = []
+        try:
+            column_lineage_info = _column_level_lineage(
+                statement,
+                dialect=dialect,
+                input_tables=upstream_table_schemas,
+                output_table=downstream_table,
+                # TODO: awsdatacatalog/default is the default db/schema for us (since we use
+                # Athena), but it won't be for everyone. We should make this configurable or pass
+                # in None
+                default_db="awsdatacatalog",
+                default_schema="default",
+            )
+        except SqlUnderstandingError as e:
+            # TODO: Needs better error handling
+            logger.error(f"Error parsing column lineage for node: {node.name}")
+
+
+        fine_grained_lineages = []
+        for cl in column_lineage_info:
+            if not cl.upstreams:
+                continue
+
+            downstream_table_urn = node.get_urn(
+                DBT_PLATFORM,  
+                self.config.env,
+                self.config.platform_instance,
+            )
+
+            upstreams = []
+            for upstream_col_ref in cl.upstreams:
+                logger.info(f"Upstream: {upstream_col_ref}")
+                try:
+                    upstreams.append(
+                        mce_builder.make_schema_field_urn(
+                            upstream_table_urns[upstream_col_ref.table],
+                            upstream_col_ref.column,
+                        )
+                    )
+                except KeyError:
+                    # TODO: Better error handling
+                    logger.error(f"Could not find table {upstream_col_ref.table} in {upstream_table_urns.keys()}")
+
+            fine_grained_lineages.append(FineGrainedLineageClass(
+                upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                upstreams=sorted(upstreams),
+                downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+                downstreams=[
+                    mce_builder.make_schema_field_urn(
+                        downstream_table_urn,
+                        cl.downstream.column,
+                    )
+                ],
+            ))
+
+        return fine_grained_lineages
+
 
     # This method attempts to read-modify and return the owners of a dataset.
     # From the existing owners it will remove the owners that are of the source_type_filter and

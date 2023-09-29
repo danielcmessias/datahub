@@ -497,6 +497,9 @@ def _column_level_lineage(  # noqa: C901
         raise SqlUnderstandingError(
             f"sqlglot failed to map columns to their source tables; likely missing/outdated table schema info: {e}"
         ) from e
+    except Exception as e:
+        # TODO: just some debugging stuff. Cleanup!
+        raise Exception(statement.sql(pretty=True, dialect=dialect), e)
     logger.debug("Qualified sql %s", statement.sql(pretty=True, dialect=dialect))
 
     column_lineage = []
@@ -846,22 +849,24 @@ def sqlglot_lineage(
         table_error or column_error are set, then the parsing failed and the
         other fields may be incomplete.
     """
-    try:
-        return _sqlglot_lineage_inner(
-            sql=sql,
-            schema_resolver=schema_resolver,
-            default_db=default_db,
-            default_schema=default_schema,
-        )
-    except Exception as e:
-        return SqlParsingResult(
-            in_tables=[],
-            out_tables=[],
-            column_lineage=None,
-            debug_info=SqlParsingDebugInfo(
-                table_error=e,
-            ),
-        )
+    # TODO: Reenable the try/except. It's just helpful to get the full stack trace
+    # when debugging right now
+    # try:
+    return _sqlglot_lineage_inner(
+        sql=sql,
+        schema_resolver=schema_resolver,
+        default_db=default_db,
+        default_schema=default_schema,
+    )
+    # except Exception as e:
+    #     return SqlParsingResult(
+    #         in_tables=[],
+    #         out_tables=[],
+    #         column_lineage=None,
+    #         debug_info=SqlParsingDebugInfo(
+    #             table_error=e,
+    #         ),
+    #     )
 
 
 def create_lineage_sql_parsed_result(
