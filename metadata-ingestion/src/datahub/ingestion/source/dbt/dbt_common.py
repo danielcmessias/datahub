@@ -423,11 +423,6 @@ class DBTNode:
         env: str,
         data_platform_instance: Optional[str],
     ) -> str:
-        # # HACK:
-        # if target_platform == "athena":
-        #     db_fqn = f"{self.schema}.{self.name}"
-        # else:
-            # db_fqn = self.get_db_fqn()
         db_fqn = self.get_db_fqn()
 
         if target_platform != DBT_PLATFORM:
@@ -1004,10 +999,6 @@ class DBTSourceBase(StatefulIngestionSourceBase):
             self.config.strip_user_ids_from_email,
         )
         for node in sorted(dbt_nodes, key=lambda n: n.dbt_name):
-
-            # if node.name != "application_event":
-            #     continue
-
             is_primary_source = mce_platform == DBT_PLATFORM
             node_datahub_urn = node.get_urn(
                 mce_platform,
@@ -1043,9 +1034,6 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 upstream_lineage_class = self._create_lineage_aspect_for_dbt_node(
                     node, all_nodes_map
                 )
-
-                # if node.name == "application_event":
-                #     raise Exception(upstream_lineage_class, node.name)
 
                 if upstream_lineage_class:
                     aspects.append(upstream_lineage_class)
@@ -1477,6 +1465,7 @@ class DBTSourceBase(StatefulIngestionSourceBase):
         statement = sqlglot.parse_one(
             node.compiled_code,
             dialect=dialect,
+            # TODO: Should this be a WARN?
             error_level=sqlglot.ErrorLevel.WARN,
         )
 
@@ -1487,13 +1476,12 @@ class DBTSourceBase(StatefulIngestionSourceBase):
                 dialect=dialect,
                 input_tables=upstream_table_schemas,
                 output_table=downstream_table,
-                default_db="awscatalog",
+                # TODO: awsdatacatalog/default is the default db/schema for us (since we use
+                # Athena), but it won't be for everyone. We should make this configurable or pass
+                # in None
+                default_db="awsdatacatalog",
                 default_schema="default",
             )
-            if node.name == "temp_9_application_event":
-                from pprint import pformat
-                logger.info(pformat(column_lineage_info))
-                raise Exception()
         except SqlUnderstandingError as e:
             # TODO: Needs better error handling
             logger.error(f"Error parsing column lineage for node: {node.name}")
